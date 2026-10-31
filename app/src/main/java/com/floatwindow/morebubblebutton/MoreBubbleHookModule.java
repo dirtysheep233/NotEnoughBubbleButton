@@ -37,7 +37,7 @@ public class MoreBubbleHookModule extends XposedModule {
     /** 编译标记：日志里能直接看出跑的是哪一版 */
     /** 气泡底部按钮（诊断显示用） */
     private static volatile View sLastCornerButton;
-    private static final String BUILD_TAG = "v1.34-telegram-pair";
+    private static final String BUILD_TAG = "v1.35-tg-in-main";
     private Object recentsViewInstance;
     private View bubbleButton;
     /** 第二行模式的容器（null = 跟随原按钮） */
@@ -60,6 +60,9 @@ public class MoreBubbleHookModule extends XposedModule {
                 || "com.android.launcher3".equals(pkg)) {
             mLauncherClassLoader = param.getDefaultClassLoader();
             hookLauncher(param);
+        } else if (pkg.startsWith("org.telegram.")) {
+            // 在 Telegram 进程里跑兼容层（见 relaxTelegramBubble）
+            installTelegramRelax(pkg, param.getDefaultClassLoader());
         } else if ("com.android.systemui".equals(pkg)) {
             // SystemUI 不支持热重载，只在首次加载时 hook
             if (!param.isFirstPackage()) return;
@@ -77,6 +80,51 @@ public class MoreBubbleHookModule extends XposedModule {
     // The right corner action uses the official Bubble -> fullscreen handoff.
     // No Bubble -> fullscreen transition is submitted, so SystemUI never rebuilds
     // the edge bubble and its adjacent plus as a side effect.
+
+
+    // ==================== Telegram 气泡兼容（运行在 Telegram 进程） ====================
+    //
+    // Telegram 自带 org.telegram.ui.BubbleActivity，但它只接受 action 为
+    // "com.tmessages.openchat*" 的 Intent，其它情况会直接 finish()。
+    // 模块在没有会话上下文时会带上 mbb_no_chat 标记，这里把 action 补齐，
+    // 让它显示空会话而不是闪退。
+
+    private static final String TG_EXTRA_FLAG = "mbb_no_chat";
+
+    private void installTelegramRelax(String pkg, ClassLoader cl) {
+        try {
+            Class<?> bubbleActivity = cl.loadClass("org.telegram.ui.BubbleActivity");
+            java.lang.reflect.Method target = null;
+            for (java.lang.reflect.Method m : bubbleActivity.getDeclaredMethods()) {
+                if (!"y".equals(m.getName()) || m.getParameterCount() != 5) continue;
+                Class<?>[] p = m.getParameterTypes();
+                if (p[0] == Intent.class && p[1] == boolean.class) {
+                    target = m;
+                    break;
+                }
+            }
+            if (target == null) {
+                Log.w(TAG, "telegram: BubbleActivity.y not found");
+                return;
+            }
+            hook(target).intercept(chain -> {
+                try {
+                    Intent intent = (Intent) chain.getArg(0);
+                    if (intent != null && intent.getBooleanExtra(TG_EXTRA_FLAG, false)) {
+                        intent.setAction("com.tmessages.openchat");
+                        intent.putExtra("chatId", 0L);
+                        Log.i(TAG, "telegram relaxed bubble: injected openchat action");
+                    }
+                } catch (Throwable t) {
+                    Log.w(TAG, "telegram relax: " + t.getMessage());
+                }
+                return chain.proceed();
+            });
+            Log.i(TAG, "telegram: hooked BubbleActivity.y in " + pkg);
+        } catch (Throwable t) {
+            Log.w(TAG, "telegram hook failed: " + t.getMessage());
+        }
+    }
 
     private void hookSystemUi(ClassLoader cl) {
         Log.i(TAG, "Hooking SystemUI...");
