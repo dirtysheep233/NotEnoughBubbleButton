@@ -34,10 +34,6 @@ import io.github.libxposed.api.XposedModuleInterface.PackageLoadedParam;
 
 public class MoreBubbleHookModule extends XposedModule {
     private static final String TAG = "MoreBubbleModule";
-    /** 编译标记：日志里能直接看出跑的是哪一版 */
-    /** 气泡底部按钮（诊断显示用） */
-    private static volatile View sLastCornerButton;
-    private static final String BUILD_TAG = "v1.36-tg-native";
     private Object recentsViewInstance;
     private View bubbleButton;
     /** 第二行模式的容器（null = 跟随原按钮） */
@@ -60,9 +56,6 @@ public class MoreBubbleHookModule extends XposedModule {
                 || "com.android.launcher3".equals(pkg)) {
             mLauncherClassLoader = param.getDefaultClassLoader();
             hookLauncher(param);
-        } else if (pkg.startsWith("org.telegram.")) {
-            // 在 Telegram 进程里跑兼容层（见 relaxTelegramBubble）
-            installTelegramRelax(pkg, param.getDefaultClassLoader());
         } else if ("com.android.systemui".equals(pkg)) {
             // SystemUI 不支持热重载，只在首次加载时 hook
             if (!param.isFirstPackage()) return;
@@ -80,51 +73,6 @@ public class MoreBubbleHookModule extends XposedModule {
     // The right corner action uses the official Bubble -> fullscreen handoff.
     // No Bubble -> fullscreen transition is submitted, so SystemUI never rebuilds
     // the edge bubble and its adjacent plus as a side effect.
-
-
-    // ==================== Telegram 气泡兼容（运行在 Telegram 进程） ====================
-    //
-    // Telegram 自带 org.telegram.ui.BubbleActivity，但它只接受 action 为
-    // "com.tmessages.openchat*" 的 Intent，其它情况会直接 finish()。
-    // 模块在没有会话上下文时会带上 mbb_no_chat 标记，这里把 action 补齐，
-    // 让它显示空会话而不是闪退。
-
-    private static final String TG_EXTRA_FLAG = "mbb_no_chat";
-
-    private void installTelegramRelax(String pkg, ClassLoader cl) {
-        try {
-            Class<?> bubbleActivity = cl.loadClass("org.telegram.ui.BubbleActivity");
-            java.lang.reflect.Method target = null;
-            for (java.lang.reflect.Method m : bubbleActivity.getDeclaredMethods()) {
-                if (!"y".equals(m.getName()) || m.getParameterCount() != 5) continue;
-                Class<?>[] p = m.getParameterTypes();
-                if (p[0] == Intent.class && p[1] == boolean.class) {
-                    target = m;
-                    break;
-                }
-            }
-            if (target == null) {
-                Log.w(TAG, "telegram: BubbleActivity.y not found");
-                return;
-            }
-            hook(target).intercept(chain -> {
-                try {
-                    Intent intent = (Intent) chain.getArg(0);
-                    if (intent != null && intent.getBooleanExtra(TG_EXTRA_FLAG, false)) {
-                        intent.setAction("com.tmessages.openchat");
-                        intent.putExtra("chatId", 0L);
-                        Log.i(TAG, "telegram relaxed bubble: injected openchat action");
-                    }
-                } catch (Throwable t) {
-                    Log.w(TAG, "telegram relax: " + t.getMessage());
-                }
-                return chain.proceed();
-            });
-            Log.i(TAG, "telegram: hooked BubbleActivity.y in " + pkg);
-        } catch (Throwable t) {
-            Log.w(TAG, "telegram hook failed: " + t.getMessage());
-        }
-    }
 
     private void hookSystemUi(ClassLoader cl) {
         Log.i(TAG, "Hooking SystemUI...");
@@ -363,397 +311,9 @@ public class MoreBubbleHookModule extends XposedModule {
             Log.i(TAG, "Hooked BubblesManager ctor for gesture bridge");
         } catch (Throwable t) { Log.w(TAG, "Hook BubblesManager ctor: " + t.getMessage()); }
 
-        // 最近任务拖进气泡这条路：BubbleData.getOrCreateBubble(TaskInfo) 直接把
-        // TaskInfo.baseIntent 塞进 Bubble.mIntent，绕过了模块所有 Entry 级 hook。
-        // 这里在它返回之后把 mIntent 换成应用的嵌入式 Activity（若有）。
-        try {
-            Class<?> dataCls = cl.loadClass("com.android.wm.shell.bubbles.BubbleData");
-            java.lang.reflect.Method m = null;
-            for (java.lang.reflect.Method candidate : dataCls.getDeclaredMethods()) {
-                if (!"getOrCreateBubble".equals(candidate.getName()) || candidate.getParameterCount() != 1) continue;
-                if (candidate.getParameterTypes()[0].getName().equals("android.app.TaskInfo")) {
-                    m = candidate;
-                    break;
-                }
-            }
-            if (m != null) {
-                hook(m).intercept(chain -> {
-                    Object bubble = chain.proceed();
-                    try {
-                        patchBubbleIntent(chain.getThisObject(), bubble);
-                    } catch (Throwable t) {
-                        Log.w(TAG, "patch bubble intent: " + t.getMessage());
-                    }
-                    return bubble;
-                });
-                Log.i(TAG, "Hooked BubbleData.getOrCreateBubble(TaskInfo) build=" + BUILD_TAG);
-            } else {
-                Log.w(TAG, "BubbleData.getOrCreateBubble(TaskInfo) not found");
-            }
-        } catch (Throwable t) {
-            Log.w(TAG, "Hook getOrCreateBubble: " + t.getMessage());
-        }
-
-        // 最终启动点：BubbleTaskViewListener.onInitialized() 里会调用
-        //   TaskViewController.startActivity(controller, mPendingIntent, intent, opts, bounds)
-        // 而 mPendingIntent 来自 Bubble.mPendingIntent（为空时才用 mIntent 现造）。
-        // libxposed API 101 的 Chain 没有 setArg，改不了入参，所以在 onInitialized 之前
-        // 把 Bubble 上的 mPendingIntent / mIntent 换成嵌入式 Activity，原方法自然带着新值执行。
-        try {
-            Class<?> listenerCls = cl.loadClass("com.android.wm.shell.bubbles.BubbleTaskViewListener");
-            final Context sysCtx = sSystemUiContext;
-            for (String name : new String[]{"setBubble", "onInitialized"}) {
-                try {
-                    java.lang.reflect.Method m = name.equals("setBubble")
-                            ? listenerCls.getMethod("setBubble",
-                                    listenerCls.getClassLoader().loadClass("com.android.wm.shell.bubbles.Bubble"))
-                            : listenerCls.getMethod("onInitialized");
-                    hook(m).intercept(chain -> {
-                        Object self = chain.getThisObject();
-                        try {
-                            // 无条件打一条：证明 hook 真的执行了（不管是否命中映射）
-                            Object b = getField(self, "mBubble");
-                            // listener 自带 mContext，比 sSystemUiContext 可靠
-                            Object listenerCtx = getField(self, "mContext");
-                            Context useCtx = listenerCtx instanceof Context ? (Context) listenerCtx : sysCtx;
-                            Log.i(TAG, name + " hit: bubble=" + (b != null)
-                                    + " pkg=" + (b != null ? getField(b, "mPackageName") : null)
-                                    + " ctx=" + (useCtx != null));
-                            if (b != null) retargetBubble(useCtx, b, name);
-                        } catch (Throwable t) {
-                            Log.w(TAG, name + " retarget: " + t.getMessage());
-                        }
-                        return chain.proceed();
-                    });
-                    Log.i(TAG, "Hooked BubbleTaskViewListener." + name + " " + BUILD_TAG);
-                } catch (Throwable t) {
-                    Log.w(TAG, "Hook " + name + ": " + t.getMessage());
-                }
-            }
-        } catch (Throwable t) {
-            Log.w(TAG, "Hook BubbleTaskViewListener.onInitialized: " + t.getMessage());
-        }
-
-        // 最彻底的位置：hook Bubble 的两个构造函数。对象一旦创建就把启动目标换掉，
-        // 之后无论谁在什么时机读 mIntent / mPendingIntent，拿到的都是新值。
-        // （上一版在 onInitialized 入口改字段太晚——Runnable 早已捕获了旧值。）
-        try {
-            Class<?> bubbleCls2 = cl.loadClass("com.android.wm.shell.bubbles.Bubble");
-            for (java.lang.reflect.Constructor<?> ctor : bubbleCls2.getDeclaredConstructors()) {
-                if (ctor.getParameterCount() != 5) continue;
-                hook(ctor).intercept(chain -> {
-                    Object result = chain.proceed();
-                    try {
-                        Object self = chain.getThisObject();
-                        Context c = sSystemUiContext;
-                        if (c == null) {
-                            // 用 ActivityThread 拿不到时，退到 Bubble 自己的 mContext 不可得，
-                            // 只能等第一次成功的路径回填
-                            Log.i(TAG, "ctor bubble: ctx still null, defer");
-                        }
-                        retargetBubble(c, self, "ctor");
-                    } catch (Throwable t) {
-                        Log.w(TAG, "ctor retarget: " + t.getMessage());
-                    }
-                    return result;
-                });
-                Log.i(TAG, "Hooked Bubble ctor(" + ctor.getParameterCount() + ")");
-            }
-        } catch (Throwable t) {
-            Log.w(TAG, "Hook Bubble ctor: " + t.getMessage());
-        }
-
-        // 真正的最终启动点：BubbleTaskViewListener 通过 TaskViewController.startActivity
-        // 把 PendingIntent 交给 TaskView。api 101 的 Chain 没有 setArg，但有
-        // proceed(Object[]) —— 用它把改好的参数数组直接传给原方法。
-        // 参数顺序：(TaskViewTaskController, PendingIntent, Intent, ActivityOptions, Rect)
-        try {
-            Class<?> tvc2 = cl.loadClass("com.android.wm.shell.taskview.TaskViewController");
-            java.lang.reflect.Method target2 = null;
-            for (java.lang.reflect.Method m : tvc2.getDeclaredMethods()) {
-                if (!"startActivity".equals(m.getName()) || m.getParameterCount() != 5) continue;
-                Class<?>[] p = m.getParameterTypes();
-                if (p[1] == android.app.PendingIntent.class && p[2] == Intent.class) {
-                    target2 = m;
-                    break;
-                }
-            }
-            if (target2 != null) {
-                hook(target2).intercept(chain -> {
-                    Object[] args = chain.getArgs().toArray();
-                    try {
-                        Object swapped = buildEmbeddablePendingIntent(
-                                (android.app.PendingIntent) args[1],
-                                (Intent) args[2]);
-                        if (swapped != null) args[1] = swapped;
-                    } catch (Throwable t) {
-                        Log.w(TAG, "final launch swap: " + t.getMessage());
-                    }
-                    return chain.proceed(args);
-                });
-                Log.i(TAG, "Hooked TaskViewController.startActivity via proceed(args) " + BUILD_TAG);
-            } else {
-                Log.w(TAG, "TaskViewController.startActivity(5) not found");
-            }
-        } catch (Throwable t) {
-            Log.w(TAG, "Hook TaskViewController.startActivity: " + t.getMessage());
-        }
-
         installLandscapeLaunchBounds(cl);
 
-        Log.i(TAG, "All SystemUI hooks installed, build=" + BUILD_TAG);
-    }
-
-    // ==================== 嵌入式友好的启动目标 ====================
-    //
-    // 有些应用的主界面是 singleTask（如 Telegram 的 LaunchActivity），塞进 TaskView 后
-    // 手势返回会把唯一任务栈清空 → 宿主直接移除；展开全屏时任务 reparent 也会重建 → 闪退。
-    // 这类应用通常会另外声明一个允许嵌入的 Activity（Telegram 的 org.telegram.ui.BubbleActivity，
-    // allowEmbedded=true + resizeableActivity=true + documentLaunchMode=always）。
-    // 这里在构造气泡 Intent 时优先选它，找不到就保持原样。
-
-    /** 已解析过的包名 → 可用的嵌入式 Activity 全名（无则记为 ""）。 */
-    private static final Map<String, String> sEmbeddableActivity = new ConcurrentHashMap<>();
-
-
-
-
-    /** 诊断用：把状态直接写进气泡底部按钮，不依赖 logcat。 */
-    private static volatile String sLastDiag = "";
-
-    private static void showDiag(String tag) {
-        sLastDiag = tag;
-        Log.i(TAG, "DIAG " + tag);
-        try {
-            android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
-            h.post(() -> {
-                try {
-                    Object btn = sLastCornerButton;
-                    if (btn instanceof android.widget.TextView) {
-                        ((android.widget.TextView) btn).setText("诊断:" + tag);
-                    }
-                } catch (Throwable ignored) {}
-            });
-        } catch (Throwable ignored) {}
-    }
-
-
-    /** 用原始 PendingIntent/Intent 的包名，重建一个指向嵌入式 Activity 的 PendingIntent。 */
-    private static android.app.PendingIntent buildEmbeddablePendingIntent(
-            android.app.PendingIntent original, Intent fallback) {
-        Intent base = null;
-        try {
-            if (original != null) base = (Intent) original.getClass().getMethod("getIntent").invoke(original);
-        } catch (Throwable ignored) {}
-        String pkg = base != null ? base.getPackage() : null;
-        if (pkg == null && fallback != null) pkg = fallback.getPackage();
-        if (pkg == null) return null;
-        String forced = EMBEDDABLE_OVERRIDES.get(pkg);
-        if (forced == null) return null;
-        Context ctx = sSystemUiContext;
-        if (ctx == null) { showDiag("ctx=null@launch"); return null; }
-        Intent target = new Intent(base != null ? base : new Intent());
-        // Telegram 的 BubbleActivity 只认 com.tmessages.openchat 这条 action 分支；
-        // 其它 action 会直接 finish()。没有 chatId 时宁可不换（保持原界面），
-        // 也不要换成 0.5 秒就消失的空白气泡。
-        // Telegram 自己注册了气泡快捷方式（ndid_xxx -> PersistableBundle{chatId=...}
-        // -> OpenChatReceiver），系统原生气泡路径是完整可用的。这种情况下不要替换，
-        // 否则会把已经正确的会话上下文拆成"无会话的 BubbleActivity"。
-        if (pkg.startsWith("org.telegram.") && base != null
-                && base.getBooleanExtra("IS_FROM_NOTIFICATION", false)) {
-            Log.i(TAG, "telegram: notification source, keep system native bubble path");
-            showDiag("native");
-            return null;
-        }
-        if ("org.telegram.ui.BubbleActivity".equals(forced)) {
-            long chatId = target.getLongExtra("chatId", 0L);
-            if (chatId == 0L) {
-                // 没有会话：仍然换成 BubbleActivity，但不走 openchat 分支。
-                // Telegram 侧由 hookRelaxedBubbleActivity() 兜住，避免它直接 finish。
-                target.putExtra("mbb_no_chat", true);
-                Log.i(TAG, "telegram: no chatId -> BubbleActivity (relaxed mode)");
-                showDiag("relaxed");
-            } else {
-                target.setAction("com.tmessages.openchat" + chatId);
-                Log.i(TAG, "telegram: open chat " + chatId);
-                showDiag("chat:" + chatId);
-            }
-        }
-        target.setComponent(new ComponentName(pkg, forced));
-        target.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
-                | Intent.FLAG_ACTIVITY_NEW_DOCUMENT
-                | Intent.FLAG_ACTIVITY_MULTIPLE_TASK);
-        showDiag("OK:" + forced.substring(forced.lastIndexOf('.') + 1));
-        Log.i(TAG, "final launch -> " + forced + " (pkg=" + pkg + ")");
-        return android.app.PendingIntent.getActivity(ctx, 0, target,
-                android.app.PendingIntent.FLAG_MUTABLE
-                        | android.app.PendingIntent.FLAG_UPDATE_CURRENT);
-    }
-
-    /** 把 Bubble 的启动目标换成嵌入式 Activity（mIntent + mPendingIntent 都换）。 */
-    private static void retargetBubble(Context ctx, Object bubble, String from) {
-        if (ctx == null) { Log.i(TAG, "retarget(" + from + "): ctx is null, skip"); showDiag("ctx=null"); return; }
-        if (sSystemUiContext == null) sSystemUiContext = ctx;
-        if (bubble == null) { Log.i(TAG, "retarget(" + from + "): bubble is null, skip"); showDiag("bubble=null"); return; }
-        Intent currentIntent = (Intent) getField(bubble, "mIntent");
-        String pkg = (String) getField(bubble, "mPackageName");
-        if (pkg == null && currentIntent != null) pkg = currentIntent.getPackage();
-        String forced = pkg != null ? EMBEDDABLE_OVERRIDES.get(pkg) : null;
-        Log.i(TAG, "retarget(" + from + "): pkg=" + pkg + " forced=" + forced
-                + " intent=" + (currentIntent != null)
-                + " keys=" + EMBEDDABLE_OVERRIDES.keySet());
-        if (pkg == null) { showDiag("pkg=null"); return; }
-        if (forced == null) { showDiag("no-map:" + pkg); return; }
-
-        Intent target = new Intent(currentIntent != null ? currentIntent : new Intent());
-        target.setComponent(new ComponentName(pkg, forced));
-        target.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
-                | Intent.FLAG_ACTIVITY_NEW_DOCUMENT
-                | Intent.FLAG_ACTIVITY_MULTIPLE_TASK);
-        try {
-            setField(bubble, "mIntent", target);
-            setField(bubble, "mPendingIntent", android.app.PendingIntent.getActivity(ctx, 0, target,
-                    android.app.PendingIntent.FLAG_MUTABLE
-                            | android.app.PendingIntent.FLAG_UPDATE_CURRENT));
-            Log.i(TAG, "retargeted(" + from + "): " + pkg + " -> " + forced);
-            showDiag("OK:" + forced.substring(forced.lastIndexOf('.') + 1));
-        } catch (Throwable t) {
-            Log.w(TAG, "retarget failed: " + t.getMessage());
-        }
-    }
-
-    /** 反射写字段，找不到就沿着父类找。 */
-    private static void setField(Object target, String name, Object value) throws Exception {
-        Class<?> c = target.getClass();
-        while (c != null) {
-            try {
-                java.lang.reflect.Field f = c.getDeclaredField(name);
-                f.setAccessible(true);
-                f.set(target, value);
-                return;
-            } catch (NoSuchFieldException e) {
-                c = c.getSuperclass();
-            }
-        }
-        throw new NoSuchFieldException(name);
-    }
-
-    /**
-     * 把 Bubble.mIntent 换成「应用的嵌入式 Activity」（如果配置了）。
-     * 只有最近任务这条路需要：BubbleData 直接复制 TaskInfo.baseIntent，不给外部改的机会。
-     */
-    private static void patchBubbleIntent(Object bubbleData, Object bubble) {
-        if (bubble == null) return;
-        Intent intent = (Intent) getField(bubble, "mIntent");
-        if (intent == null) return;
-        String pkg = intent.getPackage();
-        if (pkg == null) {
-            Object pkgName = getField(bubble, "mPackageName");
-            if (pkgName instanceof String) pkg = (String) pkgName;
-        }
-        if (pkg == null) return;
-        String forced = EMBEDDABLE_OVERRIDES.get(pkg);
-        Log.i(TAG, "bubble data intent: pkg=" + pkg + " component=" + intent.getComponent()
-                + " forced=" + forced);
-        if (forced == null) return;
-        Intent replacement = new Intent(intent);
-        replacement.setComponent(new ComponentName(pkg, forced));
-        replacement.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK
-                | Intent.FLAG_ACTIVITY_NEW_DOCUMENT
-                | Intent.FLAG_ACTIVITY_MULTIPLE_TASK);
-        try {
-            java.lang.reflect.Field f = bubble.getClass().getDeclaredField("mIntent");
-            f.setAccessible(true);
-            f.set(bubble, replacement);
-            Log.i(TAG, "bubble intent replaced: " + pkg + " -> " + forced);
-        } catch (Throwable t) {
-            Log.w(TAG, "replace bubble intent failed: " + t.getMessage());
-        }
-    }
-
-    /** 把「应用主界面」换成它的嵌入式友好 Activity（若存在）。返回是否替换。 */
-    /**
-     * 明确知道要换的应用：主界面 singleTask、塞进 TaskView 会立刻 finish，
-     * 但自带嵌入式 Activity。写死比探测可靠 —— 探测依赖 ActivityInfo 字段，
-     * 而那个字段在部分系统版本里根本不存在。
-     */
-    private static final Map<String, String> EMBEDDABLE_OVERRIDES = new java.util.HashMap<>();
-    static {
-        EMBEDDABLE_OVERRIDES.put("org.telegram.messenger.web", "org.telegram.ui.BubbleActivity");
-        EMBEDDABLE_OVERRIDES.put("org.telegram.messenger", "org.telegram.ui.BubbleActivity");
-        EMBEDDABLE_OVERRIDES.put("org.telegram.plus", "org.telegram.ui.BubbleActivity");
-    }
-
-    private static boolean preferEmbeddableActivity(Context ctx, Intent intent) {
-        // 无条件打一条：证明这段代码在当前进程里真的跑到了
-        if (intent == null) {
-            Log.i(TAG, "bubble intent: null");
-            return false;
-        }
-        String pkg = intent.getPackage();
-        Log.i(TAG, "bubble intent: pkg=" + pkg + " component=" + intent.getComponent());
-        if (pkg == null) return false;
-
-        String forced = EMBEDDABLE_OVERRIDES.get(pkg);
-        if (forced != null) {
-            intent.setComponent(new ComponentName(pkg, forced));
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
-                    | Intent.FLAG_ACTIVITY_NEW_DOCUMENT
-                    | Intent.FLAG_ACTIVITY_MULTIPLE_TASK);
-            Log.i(TAG, "bubble target(forced): " + pkg + " -> " + forced);
-            return true;
-        }
-        if (intent.getComponent() != null
-                && !intent.getComponent().getClassName().equals(pkg)) {
-            // 已经指定了具体界面（通知 contentIntent / 最近任务顶栈）时默认不覆盖，
-            // 但宿主界面若是 singleTask，塞进 TaskView 会立即自毁，此时仍要换成嵌入式 Activity。
-            String cached = sEmbeddableActivity.get(pkg);
-            if (cached != null && cached.isEmpty()) return false;
-            if (cached == null && findEmbeddableActivity(ctx, pkg) == null) return false;
-        }
-        String activity = sEmbeddableActivity.get(pkg);
-        if (activity == null) {
-            activity = findEmbeddableActivity(ctx, pkg);
-            sEmbeddableActivity.put(pkg, activity == null ? "" : activity);
-        }
-        if (activity.isEmpty()) return false;
-        intent.setComponent(new ComponentName(pkg, activity));
-        // singleTask 的任务若被复用会串味，这里明确要一个新任务实例
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
-                | Intent.FLAG_ACTIVITY_NEW_DOCUMENT
-                | Intent.FLAG_ACTIVITY_MULTIPLE_TASK);
-        Log.i(TAG, "bubble target: " + pkg + " -> " + activity);
-        return true;
-    }
-
-
-    /** 包内是否声明了 allowEmbedded + resizeableActivity 的 Activity，返回全类名。 */
-    private static String findEmbeddableActivity(Context ctx, String pkg) {
-        try {
-            android.content.pm.PackageInfo pi = ctx.getPackageManager()
-                    .getPackageInfo(pkg, android.content.pm.PackageManager.GET_ACTIVITIES);
-            if (pi == null || pi.activities == null) return null;
-            // ActivityInfo 里没有 allowEmbedded / resizeableActivity 这两个字段（只有 FLAG_* 常量），
-            // 所以按「内部 Activity + 名字里带 bubble」来挑：这类 Activity 是应用为嵌入式
-            // /气泡场景专门准备的（Telegram 的就是 org.telegram.ui.BubbleActivity）。
-            StringBuilder all = new StringBuilder();
-            String byName = null;
-            for (android.content.pm.ActivityInfo ai : pi.activities) {
-                if (ai == null || ai.name == null) continue;
-                if (all.length() < 400) all.append(ai.name).append(ai.exported ? "(e) " : " ");
-                if (ai.exported || !ai.enabled) continue;
-                String simple = ai.name.substring(ai.name.lastIndexOf('.') + 1).toLowerCase();
-                if (byName == null && simple.contains("bubble")) byName = ai.name;
-            }
-            Log.i(TAG, "activities of " + pkg + ": " + all);
-            if (byName != null) {
-                Log.i(TAG, "embeddable candidate: " + byName);
-                return byName;
-            }
-        } catch (Throwable t) {
-            Log.w(TAG, "embeddable lookup failed for " + pkg + ": " + t.getMessage());
-        }
-        return null;
+        Log.i(TAG, "All SystemUI hooks installed");
     }
 
     /**
@@ -780,7 +340,6 @@ public class MoreBubbleHookModule extends XposedModule {
                 intent.setComponent(new ComponentName(pkg, cls));
             }
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
-            preferEmbeddableActivity(ctx, intent);
 
             UserHandle user = (UserHandle) UserHandle.class.getMethod("of", int.class)
                     .invoke(null, userId);
@@ -840,10 +399,6 @@ public class MoreBubbleHookModule extends XposedModule {
                 targetIntent.setPackage(pkg);
             }
             targetIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
-            Context sysCtx = (Context) getFieldSystemUi(controller, "mContext");
-            if (sysCtx != null) preferEmbeddableActivity(sysCtx, targetIntent);
-            Log.i(TAG, reason + ": target component = " + targetIntent.getComponent()
-                    + " pkg=" + targetIntent.getPackage());
             final Intent finalIntent = targetIntent;
             final UserHandle finalUser = user;
             Runnable work = () -> {
@@ -888,26 +443,6 @@ public class MoreBubbleHookModule extends XposedModule {
      */
     private static boolean expandAppBubbleA17(Object controller, Intent intent, UserHandle user, String reason) {
         try {
-            // 所有创建应用气泡的路径最后都会到这里 —— 在这里做一次最终确认，
-            // 上面几个入口（手势 / 通知 / 多任务）漏掉的也补上。
-            if (intent != null && intent.getPackage() != null) {
-                Context c = (Context) getFieldSystemUi(controller, "mContext");
-                String forced = EMBEDDABLE_OVERRIDES.get(intent.getPackage());
-                if (forced != null) {
-                    boolean already = intent.getComponent() != null
-                            && forced.equals(intent.getComponent().getClassName());
-                    if (!already) {
-                        intent.setComponent(new ComponentName(intent.getPackage(), forced));
-                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
-                                | Intent.FLAG_ACTIVITY_NEW_DOCUMENT
-                                | Intent.FLAG_ACTIVITY_MULTIPLE_TASK);
-                        Log.i(TAG, "bubble target(final): " + intent.getPackage() + " -> " + forced
-                                + " (" + reason + ")");
-                    } else {
-                        Log.i(TAG, "bubble target(final): already " + forced + " (" + reason + ")");
-                    }
-                }
-            }
             ClassLoader cl = controller.getClass().getClassLoader();
             Class<?> bubbleCls = cl.loadClass("com.android.wm.shell.bubbles.Bubble");
             Class<?> dataCls = cl.loadClass("com.android.wm.shell.bubbles.BubbleData");
@@ -1019,36 +554,6 @@ public class MoreBubbleHookModule extends XposedModule {
         return 0;
     }
 
-
-    /**
-     * 把通知里的 chat_id / user_id 映射成 Telegram BubbleActivity 读取的 chatId / userId。
-     * 没有就直接返回，由调用方回退到「不替换」。
-     */
-    private static void copyTelegramChatExtras(Intent intent) {
-        try {
-            android.os.Bundle extras = intent.getExtras();
-            if (extras == null) return;
-            boolean hasChat = extras.containsKey("chatId");
-            if (hasChat) return;
-            // 常见两种写法：直接在 extras 上，或嵌在 bundle 里
-            long chatId = extras.getLong("chat_id", 0L);
-            long userId = extras.getLong("user_id", 0L);
-            if (chatId == 0L) {
-                android.os.Bundle inner = extras.getBundle("bundle");
-                if (inner != null) {
-                    chatId = inner.getLong("chat_id", 0L);
-                    userId = inner.getLong("user_id", 0L);
-                }
-            }
-            Log.i(TAG, "telegram extras: chat_id=" + chatId + " user_id=" + userId);
-            if (chatId == 0L) return;
-            intent.putExtra("chatId", chatId);
-            if (userId != 0L) intent.putExtra("userId", userId);
-        } catch (Throwable t) {
-            Log.w(TAG, "copyChatExtras: " + t.getMessage());
-        }
-    }
-
     private static Intent getNotificationTargetIntent(Notification notif, String pkg) {
         try {
             PendingIntent pi = notif != null ? notif.contentIntent : null;
@@ -1063,9 +568,6 @@ public class MoreBubbleHookModule extends XposedModule {
             if (pkg != null && copy.getPackage() == null) {
                 copy.setPackage(pkg);
             }
-            // Telegram 的 BubbleActivity 用 chatId/userId(long) 定位会话，
-            // 而它的通知里把这些放在 bundle 的 chat_id/user_id 键上，这里做一次映射。
-            copyTelegramChatExtras(copy);
             return copy;
         } catch (Throwable t) {
             Log.w(TAG, "notification target intent: " + t.getMessage());
@@ -1321,7 +823,6 @@ public class MoreBubbleHookModule extends XposedModule {
                 return;
             }
             final android.widget.TextView tv = (android.widget.TextView) manageButton;
-            sLastCornerButton = tv;
 
             // 按钮自身的文字必须清空：TextView 会先把 setText 的文字画一遍，MirrorDrawable 再
             // 画一遍，同一个位置就出现重影。这里只保留等宽占位，让按钮尺寸够放两段文字，
@@ -2173,10 +1674,6 @@ public class MoreBubbleHookModule extends XposedModule {
             // Always ensure package is set (BubbleData.getOrCreateBubble needs intent.getPackage())
             if (bIntent.getPackage() == null && bIntent.getComponent() != null)
                 bIntent.setPackage(bIntent.getComponent().getPackageName());
-
-            // singleTask 应用（如 Telegram）在 TaskView 里会自己 finish，优先换成它自带的嵌入式 Activity
-            preferEmbeddableActivity(ctx, bIntent);
-            Log.i(TAG, "recents bubble target: " + bIntent.getComponent() + " pkg=" + bIntent.getPackage());
 
             // Set the exact top component for precise bubble targeting (for deep-linked / secondary activities)
             try {
