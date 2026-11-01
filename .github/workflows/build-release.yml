@@ -1,16 +1,26 @@
 # MoreBubbleButton — Release 构建工作流
-# 编译 release 版本（不签名，输出 unsigned APK）
-name: Build Release (unsigned)
+#
+# 产物：
+#   1. 每次构建都上传 signed APK 作为 Actions artifact
+#   2. 推送 v* 标签（或手动触发并指定 release_tag）时，自动创建 / 更新 GitHub Release
+#
+# 签名依赖仓库 Secrets：KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD
+name: Build Release
 
 on:
-  workflow_dispatch:      # 手动触发
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: '发布标签（留空则只构建，不发 Release），例如 v1.37'
+        required: false
+        default: ''
   push:
-    tags:                 # 推送 v* 标签时触发
+    tags:
       - 'v*'
     branches: [master, 'feature/**']
 
 permissions:
-  contents: write         # 允许上传 artifact
+  contents: write
 
 jobs:
   build:
@@ -32,7 +42,6 @@ jobs:
 
       # compileSdk=37 在 Google 仓库中的包名为 platforms;android-37.0
       # （目录 android-37.0，AGP 按 platforms/android-37 查找），需显式安装并软链。
-      # runner 镜像已自带 SDK + cmdline-tools，跳过重复下载。
       - name: Install Android SDK platform 37 + build-tools
         run: |
           SDK_ROOT="${ANDROID_HOME:-$HOME/android-sdk}"
@@ -50,14 +59,65 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      - name: Build release (unsigned)
-        # 不设置任何签名环境变量 → release keystore 为空 → 产出未签名 APK
+      - name: Verify signing secrets are present
+        run: |
+          missing=""
+          [ -n "$KEYSTORE_BASE64" ]  || missing="$missing KEYSTORE_BASE64"
+          [ -n "$KEYSTORE_PASSWORD" ] || missing="$missing KEYSTORE_PASSWORD"
+          [ -n "$KEY_ALIAS" ]        || missing="$missing KEY_ALIAS"
+          [ -n "$KEY_PASSWORD" ]     || missing="$missing KEY_PASSWORD"
+          if [ -n "$missing" ]; then
+            echo "::error::缺少签名 Secrets:$missing"
+            exit 1
+          fi
+          echo "四个签名 Secrets 均已配置"
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+
+      # build.gradle.kts 会读取这些环境变量，把 keystore 解码后用于 release 签名
+      - name: Build signed release
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: ./gradlew assembleRelease --no-daemon --stacktrace
 
-      - name: Upload unsigned APK artifact
+      - name: Verify APK is signed
+        run: |
+          set -e
+          APK=$(find app/build/outputs/apk/release -name '*.apk' | head -1)
+          echo "APK=$APK"
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null | sort -V | tail -1)
+          "${BT}apksigner" verify --print-certs "$APK" | head -5
+          cp "$APK" "MoreBubbleButton-$(grep -o 'versionName = "[^"]*"' app/build.gradle.kts | head -1 | cut -d'"' -f2).apk"
+
+      - name: Upload signed APK
         uses: actions/upload-artifact@v4
         with:
-          name: MoreBubbleButton-unsigned
-          path: |
-            app/build/outputs/apk/release/*.apk
+          name: MoreBubbleButton-signed
+          path: MoreBubbleButton-*.apk
           if-no-files-found: error
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          TAG="${{ github.event.inputs.release_tag }}"
+          case "$GITHUB_REF" in
+            refs/tags/*) [ -z "$TAG" ] && TAG="${GITHUB_REF#refs/tags/}" ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if [ -n "$TAG" ]; then echo "将创建 Release: $TAG"; else echo "无标签，仅构建"; fi
+
+      - name: Create GitHub Release
+        if: steps.tag.outputs.tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: MoreBubbleButton ${{ steps.tag.outputs.tag }}
+          files: MoreBubbleButton-*.apk
+          generate_release_notes: true
+          fail_on_unmatched_files: true
