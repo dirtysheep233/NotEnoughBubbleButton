@@ -37,7 +37,7 @@ public class MoreBubbleHookModule extends XposedModule {
     /** 编译标记：日志里能直接看出跑的是哪一版 */
     /** 气泡底部按钮（诊断显示用） */
     private static volatile View sLastCornerButton;
-    private static final String BUILD_TAG = "v1.35-tg-in-main";
+    private static final String BUILD_TAG = "v1.36-tg-native";
     private Object recentsViewInstance;
     private View bubbleButton;
     /** 第二行模式的容器（null = 跟随原按钮） */
@@ -556,6 +556,15 @@ public class MoreBubbleHookModule extends XposedModule {
         // Telegram 的 BubbleActivity 只认 com.tmessages.openchat 这条 action 分支；
         // 其它 action 会直接 finish()。没有 chatId 时宁可不换（保持原界面），
         // 也不要换成 0.5 秒就消失的空白气泡。
+        // Telegram 自己注册了气泡快捷方式（ndid_xxx -> PersistableBundle{chatId=...}
+        // -> OpenChatReceiver），系统原生气泡路径是完整可用的。这种情况下不要替换，
+        // 否则会把已经正确的会话上下文拆成"无会话的 BubbleActivity"。
+        if (pkg.startsWith("org.telegram.") && base != null
+                && base.getBooleanExtra("IS_FROM_NOTIFICATION", false)) {
+            Log.i(TAG, "telegram: notification source, keep system native bubble path");
+            showDiag("native");
+            return null;
+        }
         if ("org.telegram.ui.BubbleActivity".equals(forced)) {
             long chatId = target.getLongExtra("chatId", 0L);
             if (chatId == 0L) {
