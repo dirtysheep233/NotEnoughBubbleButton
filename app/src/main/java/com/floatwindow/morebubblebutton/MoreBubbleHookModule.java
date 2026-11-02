@@ -1510,10 +1510,10 @@ public class MoreBubbleHookModule extends XposedModule {
         int abId = res.getIdentifier("action_buttons", "id", pkg);
         LinearLayout actionButtons = (LinearLayout) actionsParent.findViewById(abId);
         if (actionButtons == null) return;
-        // LinearLayout 默认 baselineAligned=true，会把整行子项按第一行文字
-        // baseline 重新分配高度；插入气泡按钮后 ClearAllPin 就会被压矮。
-        // 关掉后每个子项按自身 LayoutParams 摆放，互不影响。
-        actionButtons.setBaselineAligned(false);
+        // 注意：不要动 baselineAligned！水平 LinearLayout 正是靠 baseline 对齐
+        // 让原生按钮坐在同一基线上、行高取子项最大值。关掉会变成顶部对齐，
+        // 各子项高度不同就会矮一截并上下错位。
+        // 只需要保证所有子项垂直居中，气泡按钮按原生度量做，行高自然不变。
         // 去重
         for (int i = 0; i < actionButtons.getChildCount(); i++) {
             View child = actionButtons.getChildAt(i);
@@ -1534,14 +1534,15 @@ public class MoreBubbleHookModule extends XposedModule {
         if (insertIndex >= 0 && stock.getLayoutParams() instanceof ViewGroup.MarginLayoutParams) {
             // 度量直接沿用截图按钮，保证顶替后不改变行高与间距
             ViewGroup.MarginLayoutParams slp = (ViewGroup.MarginLayoutParams) stock.getLayoutParams();
+            // 宽度沿用原生按钮；高度一律沿用原生按钮声明的值（含 MATCH_PARENT）。
+            // 之前这里在 slp.height<=0 时退化成 WRAP_CONTENT，会让气泡按钮
+            // 按内容自测高，与原生按钮的 MATCH_PARENT 不在同一高度上 → 上下错位。
+            // LinearLayout 的正确语义就是让子项 height=MATCH_PARENT 撑满行高，
+            // 行高再由其它固定高度的原生按钮决定，所以 WRAP_CONTENT 必须避免。
             mlp = new ViewGroup.MarginLayoutParams(slp.width, slp.height);
-            // 高度必须和截图按钮完全一致，绝不 WRAP_CONTENT：
-            // 否则气泡按钮自身内容高度参与 LinearLayout 的行高计算，
-            // 会让同行的 ClearAllPin 被 baselineAligned 重新分配后压矮。
-            if (slp.height <= 0) {
-                int stockH = stock.getHeight();
-                mlp.height = stockH > 0 ? stockH
-                        : ViewGroup.LayoutParams.WRAP_CONTENT;
+            if (slp.height == ViewGroup.LayoutParams.WRAP_CONTENT) {
+                // 仅当原生按钮自身就是 wrap_content 时才跟随，保持同构
+                mlp.height = ViewGroup.LayoutParams.WRAP_CONTENT;
             }
             mlp.setMarginStart(slp.getMarginStart());
             mlp.setMarginEnd(slp.getMarginEnd());
@@ -1626,21 +1627,20 @@ public class MoreBubbleHookModule extends XposedModule {
             btn.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, stock.getTextSize());
             btn.setTypeface(stock.getTypeface());
             btn.setGravity(stock.getGravity());
-            // 关键：Button 自带 minHeight=48dp / minWidth=88dp 与默认 padding，
-            // 会把自己撑得比原生截图按钮更高，进而把同一行里的 ClearAllPin 压矮。
-            // 这里彻底清零，高度完全交给下面的 LayoutParams 决定。
+            // 关键：完全继承原生按钮的尺寸约束，一个都不要改。
+            // 之前清零 minHeight/minWidth 会让气泡按钮塌成纯文字高度，
+            // LinearLayout 取子项最大高度做行高，于是整行（连同快清按钮）一起变矮。
+            // 这里原样搬用原生按钮的 min 值，度量必然一致。
             int stockMinH = stock.getMinHeight();
-            btn.setMinHeight(stockMinH > 0 ? stockMinH : 0);
-            btn.setMinimumHeight(stockMinH > 0 ? stockMinH : 0);
-            btn.setMinimumWidth(0);
-            btn.setIncludeFontPadding(false);
+            if (stockMinH > 0) btn.setMinHeight(stockMinH);
+            int stockMinW = stock.getMinWidth();
+            if (stockMinW > 0) btn.setMinWidth(stockMinW);
             btn.setElevation(stock.getElevation());
             btn.setCompoundDrawablePadding(stock.getCompoundDrawablePadding());
         }
         // 横向内边距直接沿用截图按钮：两者都是四字标签（「屏幕截图」/「消息气泡」），
         // 字宽天然接近，不需要单独收窄，这样最贴近 ClearAllPin 的整体外观。
-        // minWidth 清零是为了让宽度由内容自适应，避免被原生值撑出多余空白。
-        btn.setMinWidth(0);
+        // 注意：这里不能再 setMinWidth(0)，否则会覆盖上面从原生按钮继承的宽度约束。
         btn.setAllCaps(false);
         if (stock != null) {
             int hPad = stock.getPaddingLeft();
