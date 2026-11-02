@@ -1630,7 +1630,7 @@ public class MoreBubbleHookModule extends XposedModule {
         }
 
         // 2) 背景：无填充涟漪（ClearAllPin 同款）
-        applyTransparentRipple(ctx, btn);
+        applyTransparentRipple(ctx, btn, stock);
 
         // 3) 图标
         int iconId = res.getIdentifier("ic_bubble_button", "drawable", pkg);
@@ -1701,7 +1701,7 @@ public class MoreBubbleHookModule extends XposedModule {
      * 主题里的 colorControlHighlight 在个别子视图 context 中是不透明纯白，
      * 遇到 alpha=0xFF 时强制替换成 12% 白。
      */
-    private static void applyTransparentRipple(Context ctx, View v) {
+    private static void applyTransparentRipple(Context ctx, View v, View shapeSource) {
         try {
             int highlight = BUBBLE_RIPPLE_FALLBACK;
             TypedArray a = null;
@@ -1714,10 +1714,27 @@ public class MoreBubbleHookModule extends XposedModule {
             }
             if ((highlight >>> 24) == 0xFF) highlight = BUBBLE_RIPPLE_FALLBACK;
 
-            GradientDrawable mask = new GradientDrawable();
-            mask.setShape(GradientDrawable.RECTANGLE);
-            mask.setCornerRadius(dpToPx(ctx, BUBBLE_RIPPLE_RADIUS_DP));
-            mask.setColor(Color.WHITE);
+            // 形状不自己造，直接从原生按钮的背景里“借”：
+            // 若原生背景是 RippleDrawable，取它的 mask 克隆一份，圆角/轮廓必然一致；
+            // 否则用 View 的实际 outline 半径兜底；再不行才退回常量圆角。
+            Drawable mask = cloneMaskFrom(shapeSource);
+
+            if (mask == null) {
+                GradientDrawable g = new GradientDrawable();
+                g.setShape(GradientDrawable.RECTANGLE);
+                float radius = dpToPx(ctx, BUBBLE_RIPPLE_RADIUS_DP);
+                if (shapeSource != null) {
+                    try {
+                        android.graphics.Outline o = new android.graphics.Outline();
+                        shapeSource.getOutlineProvider().getOutline(shapeSource, o);
+                        if (o.getRadius() > 0f) radius = o.getRadius();
+                    } catch (Throwable ignored) {
+                    }
+                }
+                g.setCornerRadius(radius);
+                g.setColor(Color.WHITE);
+                mask = g;
+            }
 
             v.setBackground(new RippleDrawable(ColorStateList.valueOf(highlight), null, mask));
             v.setBackgroundTintList(null);
@@ -1726,6 +1743,49 @@ public class MoreBubbleHookModule extends XposedModule {
         } catch (Throwable t) {
             Log.w(TAG, "applyTransparentRipple: " + t.getMessage());
             v.setBackgroundColor(Color.TRANSPARENT);
+        }
+    }
+
+    /**
+     * 从源 View 的背景里克隆出可复用为 ripple mask 的 Drawable。
+     *
+     * RippleDrawable 的 mMask 是私有字段，这里反射取出；
+     * 取不到就退化返回 null，让调用方走 outline / 常量圆角兜底。
+     */
+    private static Drawable cloneMaskFrom(View src) {
+        if (src == null) return null;
+        try {
+            Drawable bg = src.getBackground();
+            if (!(bg instanceof RippleDrawable)) return null;
+
+            Drawable m = null;
+            try {
+                java.lang.reflect.Field f = RippleDrawable.class.getDeclaredField("mMask");
+                f.setAccessible(true);
+                m = (Drawable) f.get(bg);
+            } catch (Throwable ignored) {
+            }
+            if (m == null) {
+                // Android 12+ 可能改用 mLayerMask 或直接存在 layer 里，尽力再试一次
+                try {
+                    java.lang.reflect.Field f2 = RippleDrawable.class.getDeclaredField("mLayerMask");
+                    f2.setAccessible(true);
+                    m = (Drawable) f2.get(bg);
+                } catch (Throwable ignored) {
+                }
+            }
+            if (m == null) return null;
+
+            // 必须克隆：同一个 Drawable 实例被两个 View 共用会互相干扰
+            android.graphics.drawable.Drawable.ConstantState cs = m.getConstantState();
+            Drawable copy = (cs != null) ? cs.newDrawable() : m;
+            if (copy == m) return null;   // 没克隆成功就放弃，避免共享实例
+            copy = copy.mutate();
+            copy.setAlpha(255);
+            return copy;
+        } catch (Throwable t) {
+            Log.w(TAG, "cloneMaskFrom: " + t.getMessage());
+            return null;
         }
     }
 
