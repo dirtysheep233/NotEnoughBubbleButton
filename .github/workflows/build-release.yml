@@ -3,6 +3,7 @@
 # 产物：
 #   1. 每次构建都上传 signed APK 作为 Actions artifact
 #   2. 推送 v* 标签（或手动触发并指定 release_tag）时，自动创建 / 更新 GitHub Release
+#   3. 构建失败时把 gradle 报错摘要写进 Annotation，并上传完整日志 artifact
 #
 # 签名方式：CI 内部用 apksigner 直接签名（不依赖 build.gradle 里是否配了 signingConfigs）
 # 签名依赖仓库 Secrets：KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD
@@ -33,7 +34,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
@@ -63,8 +64,73 @@ jobs:
       # ── 编译（不签名）───────────────────────────────────────────────
       # 先把「代码能不能编过」这件事单独跑出来：
       # 编译失败在这里就停，不会和签名错误混在一起，排查面更小。
+      # tee 把完整日志落到 /tmp/gradle-build.log，供失败摘要步骤读取。
       - name: Build unsigned release
-        run: ./gradlew assembleRelease --no-daemon --stacktrace
+        run: |
+          set -o pipefail
+          ./gradlew assembleRelease --no-daemon --stacktrace 2>&1 | tee /tmp/gradle-build.log
+
+      # ── 失败摘要（方法1 的核心）────────────────────────────────────
+      # 构建失败时，从日志里抽出关键行，用 ::error:: 写到 Annotation，
+      # 这样在 Actions 页面直接能看到「哪个 Task FAILED + 具体 error 行」。
+      - name: Summarize build failure
+        if: failure()
+        run: |
+          LOG=/tmp/gradle-build.log
+          if [ ! -f "$LOG" ]; then
+            echo "::error::没有找到 gradle 日志文件 $LOG（可能在构建启动前就失败了）"
+            exit 0
+          fi
+
+          echo "=========== 失败摘要开始 ==========="
+          echo "日志总行数: $(wc -l < "$LOG")"
+          echo "------------------------------------"
+
+          # 1) 是哪个 Task 挂了
+          echo "[失败任务]"
+          grep -nE '^> Task .* FAILED' "$LOG" | tail -5 || echo "  (未匹配到 '> Task ... FAILED')"
+          echo "------------------------------------"
+
+          # 2) Java 编译错误（最多 15 条，带文件:行号）
+          echo "[Java 编译错误]"
+          grep -nE 'error:' "$LOG" | head -15 || echo "  (无 Java 编译错误)"
+          echo "------------------------------------"
+
+          # 3) Gradle 根因
+          echo "[What went wrong]"
+          awk '/\* What went wrong:/{flag=1} flag{print}' "$LOG" | head -30 || echo "  (未匹配到 What went wrong)"
+          echo "------------------------------------"
+
+          # 4) R8 / 资源压缩相关（若存在）
+          echo "[R8 / 资源压缩线索]"
+          grep -nE '(minifyReleaseWithR8|shrinkReleaseResources|Missing class|ERROR:.*R8)' "$LOG" | head -10 || echo "  (无 R8 线索)"
+          echo "=========== 失败摘要结束 ==========="
+
+          # 5) 把摘要压成单条 Annotation（Annotation 内换行会被折叠，故用空格连接）
+          TASK=$(grep -oE '^> Task [^ ]+ FAILED' "$LOG" | tail -1 || true)
+          SUMMARY=$(awk '/\* What went wrong:/{flag=1} flag{print}' "$LOG" | head -12 | tr '\n' ' ' | tr -s ' ' | cut -c1-1800 || true)
+          ERRLINE=$(grep -E 'error:' "$LOG" | head -3 | tr '\n' ' ' | tr -s ' ' | cut -c1-1800 || true)
+
+          if [ -n "$TASK" ]; then
+            echo "::error title=失败任务::$TASK"
+          fi
+          if [ -n "$SUMMARY" ]; then
+            echo "::error title=What went wrong::$SUMMARY"
+          elif [ -n "$ERRLINE" ]; then
+            echo "::error title=编译错误行::$ERRLINE"
+          else
+            echo "::error title=未提取到根因::请下载 artifact 'gradle-log' 查看完整日志"
+          fi
+
+      # 完整日志也存一份，Annotation 有长度限制时用它兜底
+      - name: Upload gradle log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-log
+          path: /tmp/gradle-build.log
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Locate APK
         id: locate
