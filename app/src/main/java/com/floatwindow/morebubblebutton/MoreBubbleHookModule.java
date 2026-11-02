@@ -1718,7 +1718,20 @@ public class MoreBubbleHookModule extends XposedModule {
             View shot = row.findViewById(shotId);
             if (shot != null && shot.getVisibility() != View.INVISIBLE) {
                 shot.setVisibility(View.INVISIBLE);
-                Log.i(TAG, "stock screenshot button hidden (INVISIBLE, keeps layout bounds)");
+                // 宽度必须归零。
+                // 气泡按钮是 addView(btn, insertIndex) 插在原生截图按钮「之前」的，
+                // 而 INVISIBLE 仍然参于测量并占着原来的宽度（PixelOS 上实测 352px），
+                // 于是布局变成 [气泡 352 可见][截图 352 透明占位][clearallpin]，
+                // 中间凭空多出一块透明宽度，两颗按钮的间距就被撑开了。
+                // 高度绝对不能动：clearallpin 的 TextView 是 wrap_content，
+                // 它靠本行存在高度确定的占位兄弟被 LinearLayout 拉到 145 满行高，
+                // 高度一旦变 0 就会退回内容高度 96（就是最初的「变矮」bug）。
+                ViewGroup.LayoutParams slp = shot.getLayoutParams();
+                if (slp != null && slp.width != 0) {
+                    slp.width = 0;
+                    shot.setLayoutParams(slp);
+                }
+                Log.i(TAG, "stock screenshot button hidden (INVISIBLE + width 0, keeps row height)");
             }
         } catch (Throwable t) {
             Log.w(TAG, "hideStockScreenshotButton: " + t.getMessage());
