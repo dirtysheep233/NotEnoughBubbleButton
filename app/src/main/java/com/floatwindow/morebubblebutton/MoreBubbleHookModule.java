@@ -8,6 +8,11 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.LauncherActivityInfo;
 import android.content.pm.LauncherApps;
+import android.content.res.ColorStateList;
+import android.content.res.TypedArray;
+import android.graphics.Color;
+import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.RippleDrawable;
 import android.net.Uri;
 import android.os.IBinder;
 import android.os.Looper;
@@ -21,6 +26,7 @@ import android.view.ViewTreeObserver;
 import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import java.lang.reflect.Method;
@@ -1346,7 +1352,7 @@ public class MoreBubbleHookModule extends XposedModule {
         String pkg = ctx.getPackageName();
         ViewGroup actionsParent = (ViewGroup) actionsView;
 
-        Button btn = createBubbleButton(ctx, res, pkg);
+        Button btn = createBubbleButton(ctx, res, pkg, actionsParent);
         if (ModuleSettings.getPositionMode(ctx) == 1) {
             ensureSecondRow(actionsParent, btn, res, pkg);
         } else {
@@ -1503,23 +1509,47 @@ public class MoreBubbleHookModule extends XposedModule {
         int abId = res.getIdentifier("action_buttons", "id", pkg);
         LinearLayout actionButtons = (LinearLayout) actionsParent.findViewById(abId);
         if (actionButtons == null) return;
-
         // 去重
         for (int i = 0; i < actionButtons.getChildCount(); i++) {
             View child = actionButtons.getChildAt(i);
             if (child.getTag() != null && "bubble_button".equals(child.getTag().toString())) {
                 bubbleButton = child;
+                hideStockScreenshotButton(res, pkg, actionButtons);
                 return;
             }
         }
 
-        ViewGroup.MarginLayoutParams mlp = new ViewGroup.MarginLayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        int spId = res.getIdentifier("overview_actions_button_spacing", "dimen", pkg);
-        if (spId != 0) mlp.setMarginStart(res.getDimensionPixelSize(spId));
+        // 找到原生「屏幕截图」按钮：气泡按钮直接顶替它的位置
+        int shotId = res.getIdentifier("action_screenshot", "id", pkg);
+        View stock = (shotId != 0) ? actionButtons.findViewById(shotId) : null;
+        int insertIndex = (stock != null && stock.getParent() == actionButtons)
+                ? actionButtons.indexOfChild(stock) : -1;
+
+        ViewGroup.MarginLayoutParams mlp;
+        if (insertIndex >= 0 && stock.getLayoutParams() instanceof ViewGroup.MarginLayoutParams) {
+            // 度量直接沿用截图按钮，保证顶替后不改变行高与间距
+            ViewGroup.MarginLayoutParams slp = (ViewGroup.MarginLayoutParams) stock.getLayoutParams();
+            mlp = new ViewGroup.MarginLayoutParams(slp.width, slp.height);
+            mlp.setMarginStart(slp.getMarginStart());
+            mlp.setMarginEnd(slp.getMarginEnd());
+            mlp.topMargin = slp.topMargin;
+            mlp.bottomMargin = slp.bottomMargin;
+            mlp.gravity = slp.gravity;
+        } else {
+            mlp = new ViewGroup.MarginLayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            int spId = res.getIdentifier("overview_actions_button_spacing", "dimen", pkg);
+            if (spId != 0) mlp.setMarginStart(res.getDimensionPixelSize(spId));
+        }
         btn.setLayoutParams(mlp);
-        actionButtons.addView(btn);
+
+        if (insertIndex >= 0) actionButtons.addView(btn, insertIndex, mlp);
+        else actionButtons.addView(btn, mlp);
         bubbleButton = btn;
+
+        // 原截图按钮隐藏（不移除：容器内部还持有它并在录屏状态变化时更新）
+        hideStockScreenshotButton(res, pkg, actionButtons);
+
 
         // 捕获 RecentsView（从 actionsParent 的 parent 链查找）
         if (recentsViewInstance == null) {
@@ -1548,26 +1578,154 @@ public class MoreBubbleHookModule extends XposedModule {
         catch (Throwable t) { return false; }
     }
 
+    /** 涟漪圆角半径（dp）。 */
+    private static final int BUBBLE_RIPPLE_RADIUS_DP = 20;
+    /** 主题 colorControlHighlight 解析不出时的回退色（12% 白）。 */
+    private static final int BUBBLE_RIPPLE_FALLBACK = 0x33FFFFFF;
+
+    /**
+     * 创建气泡按钮。
+     *
+     * 样式对齐 ClearAllPin：不用原生 OverviewActionButton 样式（那会带填充胶囊），
+     * 改成克隆操作栏里「屏幕截图」按钮的文字度量，背景换成无填充的 RippleDrawable
+     * ——平时完全透明，按下才出现圆角涟漪。
+     */
     @SuppressLint("DiscouragedApi")
-    private Button createBubbleButton(Context ctx, android.content.res.Resources res, String pkg) {
-        int styleId = res.getIdentifier("OverviewActionButton.Blur", "style", pkg);
-        if (styleId == 0) styleId = res.getIdentifier("OverviewActionButton", "style", pkg);
-        Button btn = (styleId != 0) ? new Button(ctx, null, 0, styleId) : new Button(ctx);
+    private Button createBubbleButton(Context ctx, android.content.res.Resources res, String pkg,
+            ViewGroup actionsParent) {
+        Button btn = new Button(ctx);
         btn.setText("消息气泡");
         btn.setContentDescription("消息气泡");
         btn.setId(View.generateViewId());
         btn.setTag("bubble_button");
 
-        // 图标
+        // 1) 克隆原生截图按钮的文字度量（文字色 / 字号 / 字体 / 粗细）
+        TextView stock = findStockScreenshotButton(res, pkg, actionsParent);
+        if (stock != null) {
+            btn.setTextColor(stock.getTextColors());
+            btn.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, stock.getTextSize());
+            btn.setTypeface(stock.getTypeface());
+            btn.setGravity(stock.getGravity());
+            btn.setMinHeight(stock.getMinHeight());
+            btn.setElevation(stock.getElevation());
+            btn.setCompoundDrawablePadding(stock.getCompoundDrawablePadding());
+        }
+        // 横向内边距直接沿用截图按钮：两者都是四字标签（「屏幕截图」/「消息气泡」），
+        // 字宽天然接近，不需要单独收窄，这样最贴近 ClearAllPin 的整体外观。
+        // minWidth 清零是为了让宽度由内容自适应，避免被原生值撑出多余空白。
+        btn.setMinWidth(0);
+        btn.setAllCaps(false);
+        if (stock != null) {
+            int hPad = stock.getPaddingLeft();
+            if (hPad > 0) {
+                btn.setPadding(hPad, stock.getPaddingTop(), hPad, stock.getPaddingBottom());
+            }
+        }
+
+        // 2) 背景：无填充涟漪（ClearAllPin 同款）
+        applyTransparentRipple(ctx, btn);
+
+        // 3) 图标
         int iconId = res.getIdentifier("ic_bubble_button", "drawable", pkg);
         if (iconId == 0) iconId = res.getIdentifier("ic_bubble_bar", "drawable", pkg);
         if (iconId != 0) {
             android.graphics.drawable.Drawable icon = res.getDrawable(iconId, null);
-            if (icon != null) btn.setCompoundDrawablesWithIntrinsicBounds(icon, null, null, null);
+            if (icon != null) {
+                // 图标颜色跟随文字色，暗色壁纸下不会变成一团黑
+                icon = icon.mutate();
+                icon.setTint(btn.getCurrentTextColor());
+                btn.setCompoundDrawablesWithIntrinsicBounds(icon, null, null, null);
+            }
         }
 
         btn.setOnClickListener(v -> onBubbleButtonClick((View) btn.getParent().getParent()));
         return btn;
+    }
+
+    /** 查找操作栏里的原生「屏幕截图」按钮。 */
+    @SuppressLint("DiscouragedApi")
+    private static TextView findStockScreenshotButton(android.content.res.Resources res, String pkg,
+            ViewGroup actionsParent) {
+        if (actionsParent == null) return null;
+        try {
+            int abId = res.getIdentifier("action_buttons", "id", pkg);
+            ViewGroup row = (abId != 0) ? (ViewGroup) actionsParent.findViewById(abId) : actionsParent;
+            if (row == null) return null;
+            int shotId = res.getIdentifier("action_screenshot", "id", pkg);
+            if (shotId != 0) {
+                View v = row.findViewById(shotId);
+                if (v instanceof TextView) return (TextView) v;
+            }
+            for (int i = 0; i < row.getChildCount(); i++) {
+                View c = row.getChildAt(i);
+                if (c instanceof TextView && !"bubble_button".equals(String.valueOf(c.getTag()))) {
+                    return (TextView) c;
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "findStockScreenshotButton: " + t.getMessage());
+        }
+        return null;
+    }
+
+    /** 隐藏原生截图按钮。不移除：容器内部仍持有引用并在录屏状态变化时更新它。 */
+    @SuppressLint("DiscouragedApi")
+    private static void hideStockScreenshotButton(android.content.res.Resources res, String pkg,
+            LinearLayout row) {
+        if (row == null) return;
+        try {
+            int shotId = res.getIdentifier("action_screenshot", "id", pkg);
+            if (shotId == 0) return;
+            View shot = row.findViewById(shotId);
+            if (shot != null && shot.getVisibility() != View.GONE) {
+                shot.setVisibility(View.GONE);
+                Log.i(TAG, "stock screenshot button hidden");
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "hideStockScreenshotButton: " + t.getMessage());
+        }
+    }
+
+    /**
+     * 无填充涟漪背景（对齐 ClearAllPin 的 applySoftRipple）。
+     *
+     * RippleDrawable 的 content 传 null，所以背景本体完全透明；
+     * mask 是白色圆角矩形，只用来裁剪涟漪出现范围。
+     * 主题里的 colorControlHighlight 在个别子视图 context 中是不透明纯白，
+     * 遇到 alpha=0xFF 时强制替换成 12% 白。
+     */
+    private static void applyTransparentRipple(Context ctx, View v) {
+        try {
+            int highlight = BUBBLE_RIPPLE_FALLBACK;
+            TypedArray a = null;
+            try {
+                a = ctx.obtainStyledAttributes(new int[]{android.R.attr.colorControlHighlight});
+                highlight = a.getColor(0, BUBBLE_RIPPLE_FALLBACK);
+            } catch (Throwable ignored) {
+            } finally {
+                if (a != null) a.recycle();
+            }
+            if ((highlight >>> 24) == 0xFF) highlight = BUBBLE_RIPPLE_FALLBACK;
+
+            GradientDrawable mask = new GradientDrawable();
+            mask.setShape(GradientDrawable.RECTANGLE);
+            mask.setCornerRadius(dpToPx(ctx, BUBBLE_RIPPLE_RADIUS_DP));
+            mask.setColor(Color.WHITE);
+
+            v.setBackground(new RippleDrawable(ColorStateList.valueOf(highlight), null, mask));
+            v.setBackgroundTintList(null);
+            v.setForeground(null);
+            if (v instanceof Button) ((Button) v).setStateListAnimator(null);
+        } catch (Throwable t) {
+            Log.w(TAG, "applyTransparentRipple: " + t.getMessage());
+            v.setBackgroundColor(Color.TRANSPARENT);
+        }
+    }
+
+    private static int dpToPx(Context ctx, int dp) {
+        return (int) android.util.TypedValue.applyDimension(
+                android.util.TypedValue.COMPLEX_UNIT_DIP, dp,
+                ctx.getResources().getDisplayMetrics());
     }
 
     private void updateBubbleVisibility(Object av) {}
