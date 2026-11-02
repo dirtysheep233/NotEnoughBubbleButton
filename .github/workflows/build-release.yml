@@ -4,6 +4,7 @@
 #   1. 每次构建都上传 signed APK 作为 Actions artifact
 #   2. 推送 v* 标签（或手动触发并指定 release_tag）时，自动创建 / 更新 GitHub Release
 #
+# 签名方式：CI 内部用 apksigner 直接签名（不依赖 build.gradle 里是否配了 signingConfigs）
 # 签名依赖仓库 Secrets：KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD
 name: Build Release
 
@@ -17,7 +18,7 @@ on:
   push:
     tags:
       - 'v*'
-    branches: [master, 'feature/**']
+    branches: [main, master, 'feature/**']
 
 permissions:
   contents: write
@@ -59,15 +60,34 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
+      # ── 编译（不签名）───────────────────────────────────────────────
+      # 先把「代码能不能编过」这件事单独跑出来：
+      # 编译失败在这里就停，不会和签名错误混在一起，排查面更小。
+      - name: Build unsigned release
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Locate APK
+        id: locate
+        run: |
+          APK=$(find app/build/outputs/apk/release -name '*.apk' | head -1)
+          if [ -z "$APK" ]; then
+            echo "::error::未找到任何 APK 产物，请检查 build.gradle 的 buildTypes 是否包含 release"
+            exit 1
+          fi
+          echo "Unsigned APK: $APK"
+          echo "apk=$APK" >> "$GITHUB_OUTPUT"
+
+      # ── 签名 secrets 校验 ──────────────────────────────────────────
       - name: Verify signing secrets are present
         run: |
           missing=""
-          [ -n "$KEYSTORE_BASE64" ]  || missing="$missing KEYSTORE_BASE64"
+          [ -n "$KEYSTORE_BASE64" ]   || missing="$missing KEYSTORE_BASE64"
           [ -n "$KEYSTORE_PASSWORD" ] || missing="$missing KEYSTORE_PASSWORD"
-          [ -n "$KEY_ALIAS" ]        || missing="$missing KEY_ALIAS"
-          [ -n "$KEY_PASSWORD" ]     || missing="$missing KEY_PASSWORD"
+          [ -n "$KEY_ALIAS" ]         || missing="$missing KEY_ALIAS"
+          [ -n "$KEY_PASSWORD" ]      || missing="$missing KEY_PASSWORD"
           if [ -n "$missing" ]; then
             echo "::error::缺少签名 Secrets:$missing"
+            echo "请在 Settings → Secrets and variables → Actions 中添加"
             exit 1
           fi
           echo "四个签名 Secrets 均已配置"
@@ -77,23 +97,47 @@ jobs:
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
 
-      # build.gradle.kts 会读取这些环境变量，把 keystore 解码后用于 release 签名
-      - name: Build signed release
+      # ── 用 apksigner 直接签名 ─────────────────────────────────────
+      # 这样即使 build.gradle(.kts) 里没有 signingConfigs，也能产出可安装的 APK。
+      - name: Sign APK with apksigner
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-        run: ./gradlew assembleRelease --no-daemon --stacktrace
-
-      - name: Verify APK is signed
         run: |
-          set -e
-          APK=$(find app/build/outputs/apk/release -name '*.apk' | head -1)
-          echo "APK=$APK"
+          set -euo pipefail
+
+          # 解码 keystore（base64 必须单行生成：base64 -w 0）
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+          if ! keytool -list -keystore "$RUNNER_TEMP/release.keystore" \
+                 -storepass "$KEYSTORE_PASSWORD" >/dev/null 2>&1; then
+            echo "::error::keystore 无法打开，请检查 KEYSTORE_BASE64 是否为单行 base64、密码是否正确"
+            exit 1
+          fi
+
+          # 找最新的 build-tools 里的 apksigner
           BT=$(ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null | sort -V | tail -1)
-          "${BT}apksigner" verify --print-certs "$APK" | head -5
-          cp "$APK" "MoreBubbleButton-$(grep -o 'versionName = "[^"]*"' app/build.gradle.kts | head -1 | cut -d'"' -f2).apk"
+          if [ -z "$BT" ] || [ ! -x "${BT}apksigner" ]; then
+            echo "::error::未找到 apksigner（build-tools 未安装？）"
+            exit 1
+          fi
+
+          UNSIGNED="${{ steps.locate.outputs.apk }}"
+          SIGNED="MoreBubbleButton-$(grep -o 'versionName *= *"[^"]*"' app/build.gradle.kts 2>/dev/null | head -1 | cut -d'"' -f2 || true).apk"
+          [ "$SIGNED" = "MoreBubbleButton-.apk" ] && SIGNED="MoreBubbleButton-signed.apk"
+
+          cp "$UNSIGNED" "$SIGNED"
+          "${BT}apksigner" sign \
+            --ks "$RUNNER_TEMP/release.keystore" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass "pass:$KEYSTORE_PASSWORD" \
+            --key-pass "pass:$KEY_PASSWORD" \
+            "$SIGNED"
+
+          echo "== 签名校验 =="
+          "${BT}apksigner" verify --print-certs "$SIGNED" | head -5
+          echo "SIGNED_APK=$SIGNED" >> "$GITHUB_ENV"
 
       - name: Upload signed APK
         uses: actions/upload-artifact@v4
