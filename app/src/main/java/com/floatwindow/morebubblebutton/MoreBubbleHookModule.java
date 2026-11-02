@@ -1695,7 +1695,19 @@ public class MoreBubbleHookModule extends XposedModule {
         return null;
     }
 
-    /** 隐藏原生截图按钮。不移除：容器内部仍持有引用并在录屏状态变化时更新它。 */
+    /**
+     * 隐藏原生截图按钮。
+     *
+     * 关键：必须用 INVISIBLE，绝对不能用 GONE。
+     * 实测 dumpsys 对比（PixelOS recents 的 action_buttons）：
+     *   原生状态  action_screenshot 可见 0,0-352,145，clearallpin TextView 是 400,0-752,145（满行高）
+     *   用 GONE   action_screenshot 变成 0,0-0,0，clearallpin 跟着塌成 412,24-764,120（只剩 96 高）
+     * 原因：clearallpin 的 TextView 自身是 wrap_content，它之所以能满高，
+     * 是因为同行存在一个可见且高度确定（145）的原生按钮，LinearLayout 在同基线
+     * 测量时把所有子项拉到同一高度。一旦把该按钮设为 GONE，它就退出测量，
+     * 基准消失，clearallpin 退回内容高度 96，视觉上就是「上下高度变矮」。
+     * INVISIBLE 仍然参与测量并保留原尺寸，但不可见也不接收触摸，气泡按钮正好顶替它的位置。
+     */
     @SuppressLint("DiscouragedApi")
     private static void hideStockScreenshotButton(android.content.res.Resources res, String pkg,
             LinearLayout row) {
@@ -1704,9 +1716,9 @@ public class MoreBubbleHookModule extends XposedModule {
             int shotId = res.getIdentifier("action_screenshot", "id", pkg);
             if (shotId == 0) return;
             View shot = row.findViewById(shotId);
-            if (shot != null && shot.getVisibility() != View.GONE) {
-                shot.setVisibility(View.GONE);
-                Log.i(TAG, "stock screenshot button hidden");
+            if (shot != null && shot.getVisibility() != View.INVISIBLE) {
+                shot.setVisibility(View.INVISIBLE);
+                Log.i(TAG, "stock screenshot button hidden (INVISIBLE, keeps layout bounds)");
             }
         } catch (Throwable t) {
             Log.w(TAG, "hideStockScreenshotButton: " + t.getMessage());
