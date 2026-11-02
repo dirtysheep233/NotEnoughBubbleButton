@@ -1510,6 +1510,10 @@ public class MoreBubbleHookModule extends XposedModule {
         int abId = res.getIdentifier("action_buttons", "id", pkg);
         LinearLayout actionButtons = (LinearLayout) actionsParent.findViewById(abId);
         if (actionButtons == null) return;
+        // LinearLayout 默认 baselineAligned=true，会把整行子项按第一行文字
+        // baseline 重新分配高度；插入气泡按钮后 ClearAllPin 就会被压矮。
+        // 关掉后每个子项按自身 LayoutParams 摆放，互不影响。
+        actionButtons.setBaselineAligned(false);
         // 去重
         for (int i = 0; i < actionButtons.getChildCount(); i++) {
             View child = actionButtons.getChildAt(i);
@@ -1531,6 +1535,14 @@ public class MoreBubbleHookModule extends XposedModule {
             // 度量直接沿用截图按钮，保证顶替后不改变行高与间距
             ViewGroup.MarginLayoutParams slp = (ViewGroup.MarginLayoutParams) stock.getLayoutParams();
             mlp = new ViewGroup.MarginLayoutParams(slp.width, slp.height);
+            // 高度必须和截图按钮完全一致，绝不 WRAP_CONTENT：
+            // 否则气泡按钮自身内容高度参与 LinearLayout 的行高计算，
+            // 会让同行的 ClearAllPin 被 baselineAligned 重新分配后压矮。
+            if (slp.height <= 0) {
+                int stockH = stock.getHeight();
+                mlp.height = stockH > 0 ? stockH
+                        : ViewGroup.LayoutParams.WRAP_CONTENT;
+            }
             mlp.setMarginStart(slp.getMarginStart());
             mlp.setMarginEnd(slp.getMarginEnd());
             mlp.topMargin = slp.topMargin;
@@ -1614,7 +1626,14 @@ public class MoreBubbleHookModule extends XposedModule {
             btn.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, stock.getTextSize());
             btn.setTypeface(stock.getTypeface());
             btn.setGravity(stock.getGravity());
-            btn.setMinHeight(stock.getMinHeight());
+            // 关键：Button 自带 minHeight=48dp / minWidth=88dp 与默认 padding，
+            // 会把自己撑得比原生截图按钮更高，进而把同一行里的 ClearAllPin 压矮。
+            // 这里彻底清零，高度完全交给下面的 LayoutParams 决定。
+            int stockMinH = stock.getMinHeight();
+            btn.setMinHeight(stockMinH > 0 ? stockMinH : 0);
+            btn.setMinimumHeight(stockMinH > 0 ? stockMinH : 0);
+            btn.setMinimumWidth(0);
+            btn.setIncludeFontPadding(false);
             btn.setElevation(stock.getElevation());
             btn.setCompoundDrawablePadding(stock.getCompoundDrawablePadding());
         }
