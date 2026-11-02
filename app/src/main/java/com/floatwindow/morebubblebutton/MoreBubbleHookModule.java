@@ -1534,7 +1534,14 @@ public class MoreBubbleHookModule extends XposedModule {
             mlp.setMarginEnd(slp.getMarginEnd());
             mlp.topMargin = slp.topMargin;
             mlp.bottomMargin = slp.bottomMargin;
-            mlp.gravity = slp.gravity;
+            // gravity 只定义在 FrameLayout/LinearLayout 等子类的 LayoutParams 上，
+            // 基类 ViewGroup.MarginLayoutParams 无此字段，故用反射按实际类型搬运。
+            try {
+                java.lang.reflect.Field gravityField = slp.getClass().getField("gravity");
+                gravityField.setInt(mlp, gravityField.getInt(slp));
+            } catch (Throwable ignore) {
+                // 父容器类型不支持 gravity 时保持默认，不影响顶替位置
+            }
         } else {
             mlp = new ViewGroup.MarginLayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
