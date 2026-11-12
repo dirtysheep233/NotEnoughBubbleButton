@@ -1,10 +1,48 @@
-# MoreBubbleButton
+# NotEnoughBubbleButton — 最近任务中用透明气泡通知按钮顶替屏幕截图按钮（ClearAllPin 风格）
 
-Xposed 模块，为 Pixel Launcher 最近任务界面和 SystemUI 通知中心添加「消息气泡」能力。
+## 本Fork改了什么
+
+对齐 [duofuwang/ClearAllPin](https://github.com/duofuwang/ClearAllPin) 的按钮样式，让气泡按钮在
+`action_buttons` 这一行里无缝顶替原生截图按钮的位置。
+
+1. **气泡按钮不再用 `OverviewActionButton.Blur` 样式**
+   原本 `new Button(ctx, null, 0, styleId)` 会带上原生胶囊填充色。
+   现在仍是 `Button`（保留 `setStateListAnimator(null)` 去按压抬升），但改为克隆操作栏里
+   `action_screenshot` 的度量：文字色 / 字号 / 字体 / gravity / minHeight / elevation / compoundDrawablePadding，
+   并把 `minWidth` 清零、关闭 `setAllCaps`（否则中文以外的字形会被转大写）。
+
+2. **背景 = 无填充 RippleDrawable（ClearAllPin 同款）**
+```java
+GradientDrawable mask = new GradientDrawable();
+mask.setShape(GradientDrawable.RECTANGLE);
+mask.setCornerRadius(dp(radiusDp));
+mask.setColor(Color.WHITE);
+
+v.setBackground(new RippleDrawable(
+        ColorStateList.valueOf(highlight), null, mask));  // content = null → 背景本体全透明
+v.setBackgroundTintList(null);
+v.setForeground(null);
+```
+   `highlight` 取主题 `colorControlHighlight`，若 alpha 为 0xFF 则强制 `0x33FFFFFF`（12% 白）。
+   → 平时完全透明，只有按下时出现圆角涟漪。
+
+3. **隐藏原生截图按钮：`INVISIBLE` + 宽度归零**
+   在 `hideStockScreenshotButton()` 里定位 `action_screenshot`，做两件事：
+
+```java
+shot.setVisibility(View.INVISIBLE);
+
+// 宽度归零，高度绝对不动
+ViewGroup.LayoutParams slp = shot.getLayoutParams();
+if (slp != null && slp.width != 0) {
+    slp.width = 0;
+    shot.setLayoutParams(slp);
+}
+```
 
 ## 功能
 
-- 在 Pixel Launcher 多任务界面底部操作栏添加「🫧 消息气泡」按钮
+- 在 Launcher3 系启动器 多任务界面底部操作栏添加「🫧 消息气泡」按钮
 - 在任务卡片菜单（点击 app 左上角图标）中添加「🫧 消息气泡」选项
 - 点击后将当前选中的应用变为 app bubble
 - 在 SystemUI 通知中心为可打开的普通通知显示消息气泡按钮
@@ -25,13 +63,13 @@ Xposed 模块，为 Pixel Launcher 最近任务界面和 SystemUI 通知中心�
 
 ## 安装
 
-1. 下载 [最新 Release](https://github.com/TYOPXN360/MoreBubbleButton/releases) APK
+1. 下载 [最新 Release](https://github.com/dirtysheep233/NotEnoughBubbleButton/releases) APK
 2. 在 LSPosed 中安装并启用模块
 3. 设置作用域：
    - `com.google.android.apps.nexuslauncher`
    - `com.android.launcher3`（如设备使用该包名）
    - `com.android.systemui`（通知中心气泡按钮必需）
-4. 强制停止 Pixel Launcher / SystemUI，或重启设备
+4. 强制停止 Launcher / SystemUI，或重启设备
 
 ## 使用
 
@@ -49,7 +87,7 @@ Xposed 模块，为 Pixel Launcher 最近任务界面和 SystemUI 通知中心�
 
 ### 方式四：设置界面
 
-打开 MoreBubbleButton 应用 → 调整开关和按钮位置。
+打开应用 → 调整开关和按钮位置。
 
 ### 方式五：双击应用气泡图标转为全屏
 
